@@ -99,6 +99,13 @@ pub use crate::core::{
 };
 pub use crate::error::{BreakpointError, Error};
 pub use crate::memory::MemoryInterface;
+
+pub use crate::probe::{
+    AttachMethod, DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, GpioConfig,
+    GpioInterface, GpioMode, GpioNumber, GpioOutputType, GpioPull, GpioSpeed, Probe,
+    ProbeCreationError, WireProtocol, list::Lister,
+};
+
 pub use crate::session::{Permissions, Session, SessionConfig};
 
 #[doc = include_str!("../../README.md")]

@@ -4,10 +4,14 @@ mod constants;
 mod tools;
 mod usb_interface;
 
+use self::constants::BridgeStatus;
+use self::usb_interface::{StLinkUsb, StLinkUsbDevice, TIMEOUT};
+use super::{DebugProbe, DebugProbeError, WireProtocol};
+use crate::architecture::arm::{ArmError, valid_32bit_arm_address};
 use crate::{
     MemoryInterface,
     architecture::arm::{
-        ArmError, DapAccess, FullyQualifiedApAddress, Pins, SwoAccess, SwoConfig, SwoMode,
+        DapAccess, FullyQualifiedApAddress, Pins, SwoAccess, SwoConfig, SwoMode,
         ap::{
             AccessPortType,
             memory_ap::{MemoryAp, MemoryApType},
@@ -17,11 +21,10 @@ use crate::{
         dp::{DpAddress, DpRegisterAddress},
         memory::ArmMemoryInterface,
         sequences::ArmDebugSequence,
-        valid_32bit_arm_address,
     },
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeInfo, DebugProbeSelector, Probe, ProbeError,
-        ProbeFactory, WireProtocol,
+        DebugProbeInfo, DebugProbeSelector, GpioConfig, GpioInterface, GpioMode, GpioNumber,
+        GpioOutputType, GpioPull, GpioSpeed, Probe, ProbeError, ProbeFactory,
     },
 };
 
@@ -32,7 +35,6 @@ use std::thread;
 use std::{cmp::Ordering, sync::Arc, time::Duration};
 
 use constants::{JTagFrequencyToDivider, Mode, Status, SwdFrequencyToDelayCount, commands};
-use usb_interface::{StLinkUsb, StLinkUsbDevice, TIMEOUT};
 
 /// Maximum length of 32 bit reads in bytes.
 ///
@@ -50,6 +52,7 @@ const DP_PORT: u16 = 0xFFFF;
 /// A factory for creating [`StLink`] probes.
 #[derive(Debug)]
 pub struct StLinkFactory;
+const BRIDGE_NUM_GPIOS: u8 = 4;
 
 impl std::fmt::Display for StLinkFactory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -70,6 +73,7 @@ impl ProbeFactory for StLinkFactory {
             swd_speed_khz: 1_800,
             jtag_speed_khz: 1_120,
             swo_enabled: false,
+            bridge_opened: false,
 
             opened_aps: vec![],
         };
@@ -95,6 +99,7 @@ pub struct StLink<D: StLinkUsb> {
     swd_speed_khz: u32,
     jtag_speed_khz: u32,
     swo_enabled: bool,
+    bridge_opened: bool,
 
     /// List of opened APs
     opened_aps: Vec<u8>,
@@ -329,6 +334,10 @@ impl DebugProbe for StLink<StLinkUsbDevice> {
             })
             .map_err(|e| e.into())
     }
+
+    fn get_gpio_interface_mut(&mut self) -> Option<&mut dyn GpioInterface> {
+        Some(self as _)
+    }
 }
 
 impl<D: StLinkUsb> Drop for StLink<D> {
@@ -336,6 +345,9 @@ impl<D: StLinkUsb> Drop for StLink<D> {
         // We ignore the error cases as we can't do much about it anyways.
         if self.swo_enabled {
             let _ = self.disable_swo();
+        }
+        if self.bridge_opened {
+            let _ = self.close_bridge();
         }
         let _ = self.enter_idle();
     }
@@ -1161,6 +1173,139 @@ impl<D: StLinkUsb> StLink<D> {
 
         Ok(())
     }
+
+    fn send_bridge_command(
+        &mut self,
+        cmd: &[u8],
+        write_data: &[u8],
+        read_data: &mut [u8],
+        timeout: Duration,
+    ) -> Result<(), StlinkError> {
+        self.device
+            .write_bridge(cmd, write_data, read_data, timeout)?;
+        match BridgeStatus::from(read_data[0]) {
+            BridgeStatus::Ok => {
+                self.bridge_opened = true;
+                Ok(())
+            }
+            status => {
+                tracing::warn!("send_bridge_command {} failed: {:?}", cmd[0], status);
+                Err(StlinkError::BridgeCommandFailed(status))
+            }
+        }
+    }
+
+    fn close_bridge(&mut self) -> Result<(), StlinkError> {
+        // Interface to close (0 = all).
+        let iface = 0;
+        let mut result = [0u8; 2];
+        self.send_bridge_command(
+            &[commands::BRIDGE_COMMAND, commands::BRIDGE_CLOSE, iface],
+            &[],
+            &mut result,
+            TIMEOUT,
+        )?;
+        Ok(())
+    }
+}
+
+impl GpioInterface for StLink<StLinkUsbDevice> {
+    /// Note: Unclear if init works correct without providing configs for all 4 GPIOs.
+    fn init_gpio(&mut self, configs: &[(GpioNumber, GpioConfig)]) -> Result<(), DebugProbeError> {
+        fn config_value(config: &GpioConfig) -> u8 {
+            // Bit1-0 mode, Bit3-2 speed, Bit5-4 pull, Bit6 output type
+            let speed = match config.speed {
+                GpioSpeed::Low => 0,
+                GpioSpeed::Medium => 1,
+                GpioSpeed::High => 2,
+                GpioSpeed::VeryHigh => 3,
+            } << 2;
+            match config.mode {
+                GpioMode::Input(pull) => {
+                    let pull = match pull {
+                        GpioPull::No => 0,
+                        GpioPull::Up => 1,
+                        GpioPull::Down => 2,
+                    };
+                    speed | (pull << 4)
+                }
+                GpioMode::Output(output_type) => {
+                    let output_type = match output_type {
+                        GpioOutputType::PushPull => 0,
+                        GpioOutputType::OpenDrain => 1,
+                    };
+                    1 | speed | (output_type << 6)
+                }
+                GpioMode::Analog => 2 | speed,
+            }
+        }
+
+        let mut cmd = [0u8; 7];
+        cmd[0] = commands::BRIDGE_COMMAND;
+        cmd[1] = commands::BRIDGE_INIT_GPIO;
+        for (gpio, config) in configs {
+            if gpio.0 >= BRIDGE_NUM_GPIOS {
+                Err(StlinkError::BridgeGpioOutOfRange)?;
+            }
+            // TODO: Is this correct? At least seems to fail when initializing only pin 3.
+            cmd[2] |= 1 << gpio.0;
+            cmd[3 + gpio.0 as usize] = config_value(config);
+        }
+        let mut result = [0u8; 2];
+        self.send_bridge_command(&cmd, &[], &mut result, TIMEOUT)?;
+        Ok(())
+    }
+
+    fn write_gpio(&mut self, outputs: &[(GpioNumber, bool)]) -> Result<(), DebugProbeError> {
+        let mut mask = 0;
+        let mut value = 0;
+        for (output, state) in outputs {
+            if output.0 >= BRIDGE_NUM_GPIOS {
+                Err(StlinkError::BridgeGpioOutOfRange)?;
+            }
+            mask |= 1 << output.0;
+            if *state {
+                value |= 1 << output.0;
+            }
+        }
+        let cmd = [
+            commands::BRIDGE_COMMAND,
+            commands::BRIDGE_WRITE_GPIO,
+            mask,
+            value,
+        ];
+
+        let mut response = [0; 8];
+        self.send_bridge_command(&cmd, &[], &mut response, TIMEOUT)?;
+        if response[2] & mask != 0 {
+            Err(StlinkError::BridgeGpioError)?;
+        }
+        Ok(())
+    }
+
+    fn read_gpio(
+        &mut self,
+        inputs: &[GpioNumber],
+        result: &mut [bool],
+    ) -> Result<(), DebugProbeError> {
+        let mut mask = 0;
+        for input in inputs {
+            if input.0 >= BRIDGE_NUM_GPIOS {
+                Err(StlinkError::BridgeGpioOutOfRange)?;
+            }
+            mask |= 1 << input.0;
+        }
+        let cmd = [commands::BRIDGE_COMMAND, commands::BRIDGE_READ_GPIO, mask];
+        let mut response = [0; 8];
+        self.send_bridge_command(&cmd, &[], &mut response, TIMEOUT)?;
+        if response[2] & mask != 0 {
+            Err(StlinkError::BridgeGpioError)?;
+        }
+        for (i, input) in inputs.iter().enumerate() {
+            result[i] = (response[3] & (1 << input.0)) != 0;
+        }
+        Ok(())
+    }
 }
 
 const fn memory_command(command: u8, address: u32, len: usize, apsel: u8) -> [u8; 9] {
@@ -1247,6 +1392,18 @@ pub enum StlinkError {
 
     /// USB error.
     Usb(#[from] std::io::Error),
+
+    /// Bridge Command failed with status {0:?}.
+    BridgeCommandFailed(BridgeStatus),
+
+    /// No bridge support for this STLink.
+    BridgeNotSupported,
+
+    /// Bridge GPIO is outside valid range.
+    BridgeGpioOutOfRange,
+
+    /// Bridge GPIO error.
+    BridgeGpioError,
 }
 
 impl ProbeError for StlinkError {}
@@ -1902,6 +2059,7 @@ mod test {
                 swd_speed_khz: 0,
                 jtag_speed_khz: 0,
                 swo_enabled: false,
+                bridge_opened: false,
                 opened_aps: vec![],
             }
         }
@@ -1958,6 +2116,16 @@ mod test {
             _timeout: Duration,
         ) -> Result<usize, StlinkError> {
             unimplemented!("Not implemented for MockUSB")
+        }
+
+        fn write_bridge(
+            &mut self,
+            _cmd: &[u8],
+            _write_data: &[u8],
+            _read_data: &mut [u8],
+            _timeout: Duration,
+        ) -> Result<(), StlinkError> {
+            todo!()
         }
     }
 
